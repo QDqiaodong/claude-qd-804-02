@@ -32,6 +32,30 @@
         >
           <el-option v-for="s in stationOptions" :key="s.id" :label="s.name" :value="s.id" />
         </el-select>
+
+        <!-- 当前值班员身份：失败通知按人查收（演示环境代替登录） -->
+        <el-select
+          :model-value="person"
+          size="small"
+          placeholder="值班员身份"
+          style="width: 132px"
+          filterable
+          allow-create
+          clearable
+          :reserve-keyword="false"
+          @change="changePerson"
+        >
+          <el-option
+            v-for="p in PERSON_PRESETS"
+            :key="p"
+            :label="`${p}（值班员）`"
+            :value="p"
+          />
+        </el-select>
+
+        <!-- 操作失败站内通知：调度员/监护人各收各的、各自确认 -->
+        <NotificationBell />
+
         <div class="ops-clock">
           <div class="ops-clock-date">{{ selectedDate }}</div>
           <div class="ops-clock-week">{{ weekdayText }} · {{ shiftText }}</div>
@@ -91,6 +115,8 @@ import { computed, onMounted, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { currentPath, currentView, go, routes } from './router'
 import { substations, timeline } from './api'
+import { currentPerson, setCurrentPerson, PERSON_PRESETS } from './session'
+import NotificationBell from './components/NotificationBell.vue'
 
 /** 时间轴可见天数 */
 const WINDOW = 7
@@ -101,6 +127,13 @@ const selectedDate = ref(today)
 const days = ref([])
 const stationOptions = ref([])
 const substationId = ref(null)
+
+/** 当前值班员（通知按姓名查收）；身份变更即时反映到铃铛角标 */
+const person = currentPerson
+
+function changePerson(name) {
+  setCurrentPerson(name || '')
+}
 
 const weekdayText = computed(() => dayWeekCn(selectedDate.value))
 const shiftText = computed(() => (new Date().getHours() < 16 ? '白班 · 08:00—16:00' : '夜班 · 16:00—08:00'))

@@ -15,6 +15,7 @@ SET NAMES utf8mb4;
 DROP TABLE IF EXISTS `safety_measure_log`;
 DROP TABLE IF EXISTS `safety_measure`;
 DROP TABLE IF EXISTS `work_ticket_event`;
+DROP TABLE IF EXISTS `step_fail_notification`;
 DROP TABLE IF EXISTS `operation_step`;
 DROP TABLE IF EXISTS `operation_ticket`;
 DROP TABLE IF EXISTS `work_ticket`;
@@ -211,6 +212,29 @@ CREATE TABLE `operation_step` (
     UNIQUE KEY `uk_step_ticket_no` (`ticket_id`, `step_no`),
     KEY `idx_step_ticket` (`ticket_id`)
 ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_unicode_ci COMMENT ='倒闸操作步骤';
+
+-- ---------------------------- 9-1. 操作失败站内通知（调度员/监护人各一行，已读互不覆盖） ----------------------------
+-- 一次失败登记向本票调度员、监护人各生成一行；双方分别确认已读，read_time 各自独立。
+-- 原步重试成功后 resolved=1（解除），双方已读时间保留；该表只增不物理删除，解除行也保留留痕。
+CREATE TABLE `step_fail_notification` (
+    `id`             BIGINT       NOT NULL AUTO_INCREMENT,
+    `ticket_id`      BIGINT       NOT NULL COMMENT '所属操作票',
+    `ticket_no`      VARCHAR(64)  DEFAULT NULL COMMENT '票号（冗余，通知直接展示）',
+    `step_no`        INT          NOT NULL COMMENT '失败步骤序号',
+    `action_desc`    VARCHAR(255) DEFAULT NULL COMMENT '步骤内容（冗余）',
+    `fail_person`    VARCHAR(32)  DEFAULT NULL COMMENT '失败登记人',
+    `fail_time`      DATETIME     NOT NULL COMMENT '失败发生时间',
+    `fail_reason`    VARCHAR(255) NOT NULL COMMENT '失败原因',
+    `recipient_name` VARCHAR(32)  NOT NULL COMMENT '接收人（本票调度员或监护人姓名）',
+    `recipient_role` VARCHAR(16)  NOT NULL COMMENT '接收角色：DISPATCHER 调度员/GUARDIAN 监护人',
+    `read_time`      DATETIME     DEFAULT NULL COMMENT '该接收人确认已读时间（双方各自独立）',
+    `resolved`       TINYINT(1)   NOT NULL DEFAULT 0 COMMENT '原步骤重试成功后转为已解除：0 未解除 1 已解除',
+    `resolve_time`   DATETIME     DEFAULT NULL COMMENT '解除时间（重试成功时间）',
+    PRIMARY KEY (`id`),
+    KEY `idx_sfn_recipient` (`recipient_name`, `resolved`),
+    KEY `idx_sfn_ticket_step` (`ticket_id`, `step_no`, `resolved`),
+    KEY `idx_sfn_ticket` (`ticket_id`)
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_unicode_ci COMMENT ='倒闸操作失败站内通知';
 
 -- ---------------------------- 10. 安全措施（逐项确认闭环） ----------------------------
 CREATE TABLE `safety_measure` (

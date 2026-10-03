@@ -26,6 +26,10 @@ import com.substation.ops.repository.OperationTicketRepository;
  * 后提交者在锁内重检，只会看到「已执行」，不会生成重复执行记录。
  * 部分失败：失败步标记 FAILED 停在原位，票保持 RUNNING，后续步不可越过；
  * 重新进入页面仍显示真实阶段与失败原因，可在原步重试成功后继续推进。
+ *
+ * 失败通知：失败记录落库的同一事务内向本票调度员、监护人各发一条站内通知
+ * （双方各自确认已读、互不覆盖）；原步重试成功后通知置为已解除并保留双方已读时间。
+ * 通知只负责告知与确认，不参与任何重试闸门判定。
  */
 @Service
 public class OperationTicketService {
@@ -33,13 +37,16 @@ public class OperationTicketService {
     private final OperationTicketRepository ticketRepository;
     private final OperationStepRepository stepRepository;
     private final BayRepository bayRepository;
+    private final StepFailNotificationService notificationService;
 
     public OperationTicketService(OperationTicketRepository ticketRepository,
                                   OperationStepRepository stepRepository,
-                                  BayRepository bayRepository) {
+                                  BayRepository bayRepository,
+                                  StepFailNotificationService notificationService) {
         this.ticketRepository = ticketRepository;
         this.stepRepository = stepRepository;
         this.bayRepository = bayRepository;
+        this.notificationService = notificationService;
     }
 
     @Transactional(readOnly = true)
@@ -120,6 +127,10 @@ public class OperationTicketService {
         map.put("bayName", bay == null ? "" : bay.getName());
 
         List<OperationStep> steps = stepRepository.findByTicketIdOrderByStepNoAsc(ticket.getId());
+        // 该票全部失败通知（含已解除）：失败步用于标出尚未确认的角色，
+        // 重试成功后的步骤用于展示解除与双方已读留痕
+        Map<Integer, List<Map<String, Object>>> noticesByStep =
+                notificationService.groupByStep(ticket.getId(), false);
         List<Map<String, Object>> stepList = new ArrayList<>();
         OperationStep nextStep = null;
         for (OperationStep s : steps) {
@@ -138,6 +149,20 @@ public class OperationTicketService {
             item.put("done", done);
             item.put("failed", failed);
             item.put("executable", !done && nextStep == null);
+
+            // 该步的失败通知（未解除 + 已解除历史）：页面据此持续标出未确认角色、展示解除留痕
+            List<Map<String, Object>> stepNotices = noticesByStep.getOrDefault(s.getStepNo(), List.of());
+            item.put("failNotices", stepNotices);
+            List<Map<String, Object>> activeNotices = stepNotices.stream()
+                    .filter(n -> Boolean.FALSE.equals(n.get("resolved")))
+                    .toList();
+            item.put("pendingAckRoles", activeNotices.stream()
+                    .filter(n -> Boolean.FALSE.equals(n.get("read")))
+                    .map(n -> n.get("recipientRoleName"))
+                    .distinct()
+                    .toList());
+            item.put("hasFailNotice", !activeNotices.isEmpty());
+
             String blockedHint;
             if (done) {
                 blockedHint = "";
@@ -209,11 +234,16 @@ public class OperationTicketService {
 
         target.setStatus(OperationStep.STATUS_DONE);
         target.setExecutePerson(person);
-        target.setExecuteTime(LocalDateTime.now());
+        LocalDateTime executedAt = LocalDateTime.now();
+        target.setExecuteTime(executedAt);
         target.setFailPerson(null);
         target.setFailTime(null);
         target.setFailReason(null);
         stepRepository.save(target);
+
+        // 原步重试成功：该步未解除的失败通知全部转为已解除，双方已读时间原样保留。
+        // 通知状态不影响重试本身——无论双方是否确认过，重试都照常生效。
+        notificationService.resolveStep(ticket.getId(), stepNo, executedAt);
 
         // 直接以数据库当前状态重新统计，避免重试（FAILED→DONE）时重复计数
         List<OperationStep> latest = stepRepository.findByTicketIdOrderByStepNoAsc(ticket.getId());
@@ -260,13 +290,18 @@ public class OperationTicketService {
             throw new BizException("只能对当前待执行的第 " + firstUndone.getStepNo() + " 步登记失败，不能提前登记后续步骤");
         }
 
+        LocalDateTime failedAt = LocalDateTime.now();
         target.setStatus(OperationStep.STATUS_FAILED);
         target.setFailPerson(person);
-        target.setFailTime(LocalDateTime.now());
+        target.setFailTime(failedAt);
         target.setFailReason(reason);
         stepRepository.save(target);
         ticket.setStatus(OperationTicket.STATUS_RUNNING);
         ticketRepository.save(ticket);
+
+        // 失败记录落库的同一事务内通知本票调度员、监护人（各一行，已读互不覆盖）。
+        // 未读不影响重试；同一步在解除前再次登记失败会刷新通知并重新置未读。
+        notificationService.notifyFailure(ticket, target, person, reason);
         return detail(id);
     }
 }

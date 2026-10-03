@@ -102,4 +102,14 @@ export const executeStep = (id, stepNo, person) =>
 export const failStep = (id, stepNo, person, reason) =>
   http.post(`/operation-tickets/${id}/steps/${stepNo}/fail`, { person, reason })
 
+// 倒闸操作失败站内通知（调度员/监护人各收各的、各自确认已读）
+export const failNotifications = (person) =>
+  http.get('/notifications', { params: { person } })
+
+export const failNotificationUnread = (person) =>
+  http.get('/notifications/unread-count', { params: { person } })
+
+export const readFailNotification = (id, person) =>
+  http.post(`/notifications/${id}/read`, { person })
+
 export default http
