@@ -31,6 +31,9 @@
               style="margin-top: 6px"
             />
             <div v-if="t.failedSteps" class="tk-fail">有 {{ t.failedSteps }} 步操作失败，待重试</div>
+            <div v-if="t.noticeUnconfirmedRoles && t.noticeUnconfirmedRoles.length" class="tk-unconfirmed">
+              失败通知待确认：{{ t.noticeUnconfirmedRoles.join('、') }}
+            </div>
           </div>
           <div v-if="!list.length" class="ops-empty">当天暂无操作票</div>
         </div>
@@ -58,14 +61,35 @@
           <div
             v-for="s in current.steps"
             :key="s.stepNo"
+            :ref="(el) => bindStepEl(el, s.stepNo)"
             class="step-row"
-            :class="{ done: s.done, next: s.executable, blocked: !s.done && !s.executable, failed: s.failed }"
+            :class="{ done: s.done, next: s.executable, blocked: !s.done && !s.executable, failed: s.failed, focus: focusStepNo === s.stepNo }"
           >
             <div class="step-no">{{ s.stepNo }}</div>
             <div class="step-desc">
               {{ s.actionDesc }}
               <div v-if="s.failed" class="step-fail">
                 操作失败：{{ s.failReason }}（{{ s.failPerson }} · {{ fmt(s.failTime) }}），请在本步重试
+              </div>
+              <!-- 失败通知确认情况：调度员/监护人各自确认，彼此不覆盖；未确认角色持续标红（未读不影响重试） -->
+              <div v-if="s.failureNotice" class="step-notice">
+                <span class="sn-title">失败通知确认：</span>
+                <span class="sn-role" :class="{ ok: s.failureNotice.dispatcherRead }">
+                  调度员{{ s.failureNotice.dispatcherRead ? `已确认 ${fmt(s.failureNotice.dispatcherReadTime)}` : '未确认' }}
+                </span>
+                <span class="sn-sep">/</span>
+                <span class="sn-role" :class="{ ok: s.failureNotice.guardianRead }">
+                  监护人{{ s.failureNotice.guardianRead ? `已确认 ${fmt(s.failureNotice.guardianReadTime)}` : '未确认' }}
+                </span>
+                <el-button
+                  v-if="canAckNotice(s) && !myNoticeRead(s)"
+                  link
+                  type="primary"
+                  size="small"
+                  style="margin-left: 6px"
+                  @click="ackNotice(s)"
+                >我确认已读</el-button>
+                <span v-else-if="canAckNotice(s) && myNoticeRead(s)" class="sn-mine-ok">（我已确认）</span>
               </div>
             </div>
             <div class="step-meta">
@@ -128,6 +152,23 @@
             <span class="ps-who">{{ s.executePerson }}</span>
           </div>
           <div class="preview-status">票面状态：{{ current.statusName }}</div>
+
+          <div v-if="current.failureNotices && current.failureNotices.length" class="preview-notices">
+            <div class="preview-title">失败通知留痕（不可删除）</div>
+            <div
+              v-for="n in current.failureNotices"
+              :key="n.id"
+              class="pn-item"
+              :class="{ resolved: n.resolved }"
+            >
+              <div>第 {{ n.stepNo }} 步 · 致{{ n.recipientRoleName }} {{ n.recipientName }}</div>
+              <div class="pn-reason">{{ n.failReason }} · {{ fmt(n.failTime) }}</div>
+              <div class="pn-state">
+                {{ n.readTime ? `本人已确认 ${fmt(n.readTime)}` : '本人未确认' }}
+                ｜{{ n.resolved ? `已解除 ${fmt(n.resolvedTime)}（重试成功，已读时间保留）` : '未解除' }}
+              </div>
+            </div>
+          </div>
         </template>
       </div>
     </div>
@@ -154,9 +195,16 @@
 </template>
 
 <script setup>
-import { computed, onBeforeUnmount, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
-import { executeStep, failStep, operationTicket, operationTickets } from '../api'
+import {
+  executeStep,
+  failStep,
+  operationTicket,
+  operationTickets,
+  readFailureNotice
+} from '../api'
+import { currentUser, openTicketRequest, pokeNotices } from '../session'
 
 const props = defineProps({
   date: { type: String, required: true },
@@ -172,6 +220,8 @@ const targetDesc = ref('')
 const failVisible = ref(false)
 const failPersonInput = ref('')
 const failReason = ref('')
+const focusStepNo = ref(null)
+const stepEls = new Map()
 
 const doneSteps = computed(() => (current.value ? current.value.steps.filter((s) => s.done) : []))
 
@@ -179,20 +229,77 @@ function fmt(v) {
   return v ? String(v).replace('T', ' ').slice(5, 16) : ''
 }
 
+function bindStepEl(el, stepNo) {
+  if (el) stepEls.set(stepNo, el)
+  else stepEls.delete(stepNo)
+}
+
+/** 当前值班员是否为本票调度员/监护人（只有接收人能确认自己那条通知） */
+function myNoticeRoles(s) {
+  const fn = s.failureNotice
+  if (!fn || !currentUser.value) return []
+  const roles = []
+  if (fn.dispatcherName === currentUser.value) roles.push('DISPATCHER')
+  if (fn.guardianName === currentUser.value) roles.push('GUARDIAN')
+  return roles
+}
+
+function canAckNotice(s) {
+  return myNoticeRoles(s).length > 0
+}
+
+function myNoticeRead(s) {
+  const fn = s.failureNotice
+  return myNoticeRoles(s).every((r) =>
+    r === 'DISPATCHER' ? fn.dispatcherRead : fn.guardianRead)
+}
+
+async function ackNotice(s) {
+  const fn = s.failureNotice
+  const pending = myNoticeRoles(s)
+    .filter((r) => (r === 'DISPATCHER' ? !fn.dispatcherRead : !fn.guardianRead))
+    .map((r) => (r === 'DISPATCHER' ? fn.dispatcherNoticeId : fn.guardianNoticeId))
+  try {
+    for (const id of pending) {
+      await readFailureNotice(id, currentUser.value)
+    }
+    ElMessage.success('已确认本人已读；对方确认状态不受影响')
+    await loadDetail(current.value.id)
+    pokeNotices()
+  } catch (e) {
+    ElMessage.error(e.message)
+  }
+}
+
 function selectTicket(t) {
+  focusStepNo.value = null
   loadDetail(t.id)
 }
 
-async function loadDetail(id) {
+async function loadDetail(id, focusNo = null) {
   const res = await operationTicket(id)
   current.value = res.data
+  if (focusNo != null) {
+    focusStepNo.value = focusNo
+    await nextTick()
+    scrollToStep(focusNo)
+  }
 }
 
-async function reload(keepId) {
+function scrollToStep(stepNo) {
+  const el = stepEls.get(stepNo)
+  if (el && el.scrollIntoView) {
+    el.scrollIntoView({ behavior: 'smooth', block: 'center' })
+  }
+}
+
+async function reload(keepId, focusNo = null) {
   const res = await operationTickets(props.date)
   list.value = res.data || []
-  if (list.value.length) {
-    await loadDetail(keepId || list.value[0].id)
+  if (keepId && list.value.some((t) => t.id === keepId)) {
+    await loadDetail(keepId, focusNo)
+  } else if (list.value.length) {
+    await loadDetail(list.value[0].id, focusNo)
   } else {
     current.value = null
   }
@@ -215,6 +322,8 @@ async function confirmExecute() {
     await executeStep(current.value.id, targetStep.value, person.value)
     ElMessage.success(`第 ${targetStep.value} 步已执行`)
     visible.value = false
+    // 重试成功后通知由服务端转「已解除」，刷新铃铛与票面确认标记（已读时间保留）
+    pokeNotices()
     await reload(current.value.id)
   } catch (e) {
     ElMessage({ message: e.message, type: 'error', duration: 3600, showClose: true })
@@ -237,17 +346,54 @@ async function confirmFail() {
   }
   try {
     await failStep(current.value.id, targetStep.value, failPersonInput.value, failReason.value)
-    ElMessage.warning(`第 ${targetStep.value} 步已登记失败，停在该步待重试`)
+    ElMessage.warning(`第 ${targetStep.value} 步已登记失败，停在该步待重试；已通知本票调度员、监护人`)
     failVisible.value = false
-    await reload(current.value.id)
+    // 失败落库即生成站内通知，立刻刷新铃铛红点
+    pokeNotices()
+    await reload(current.value.id, targetStep.value)
   } catch (e) {
     ElMessage.error(e.message)
   }
 }
 
-watch(() => props.date, () => reload(), { immediate: true })
+// 日期切换：优先响应通知跳转指定的票，否则保持当前票或取第一张
+watch(() => props.date, (d) => {
+  const jump = consumeJumpForDate(d)
+  reload(jump?.ticketId, jump?.focusStepNo)
+}, { immediate: true })
 
-// 多终端协作：每 8 秒静默刷新，另一值班员的步骤执行/失败登记会及时反映为真实阶段
+// 已在操作票页时点击通知：直接换票并定位失败步骤
+watch(openTicketRequest, async (req) => {
+  if (!req) return
+  if (req.issueDate && req.issueDate !== props.date) {
+    // 日期不同：App 会切日期，由上面的 props.date watcher 统一处理，避免加载错误日期的列表
+    return
+  }
+  if (!current.value || current.value.id !== req.ticketId) {
+    // 票可能不在当天列表（时间轴窗口之外），直接拉票面详情，列表保持服务端返回
+    await loadDetail(req.ticketId, req.focusStepNo)
+    if (!list.value.some((t) => t.id === req.ticketId)) {
+      const res = await operationTickets(props.date).catch(() => null)
+      if (res) list.value = res.data || []
+    }
+  } else {
+    focusStepNo.value = req.focusStepNo
+    await nextTick()
+    if (req.focusStepNo != null) scrollToStep(req.focusStepNo)
+  }
+})
+
+function consumeJumpForDate(date) {
+  const req = openTicketRequest.value
+  if (req && (!req.issueDate || req.issueDate === date)) {
+    // 一次性跳转：消费后清空，避免之后手动翻看时间轴又被拉回该票
+    openTicketRequest.value = null
+    return { ticketId: req.ticketId, focusStepNo: req.focusStepNo }
+  }
+  return null
+}
+
+// 多终端协作：每 8 秒静默刷新，另一值班员的步骤执行/失败登记/通知确认会及时反映为真实阶段
 let pollTimer = setInterval(() => {
   if (!visible.value && !failVisible.value && current.value) {
     loadDetail(current.value.id).catch(() => {})
@@ -345,11 +491,102 @@ onBeforeUnmount(() => clearInterval(pollTimer))
   font-weight: 700;
 }
 
+/* ---------- 失败通知双方确认标记 ---------- */
+.step-notice {
+  margin-top: 4px;
+  font-size: 11px;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 2px;
+}
+
+.sn-title {
+  color: var(--ops-grey);
+}
+
+.sn-role {
+  color: #c62828;
+  font-weight: 700;
+}
+
+.sn-role.ok {
+  color: var(--ops-green);
+  font-weight: 400;
+}
+
+.sn-sep {
+  color: var(--ops-grey);
+  margin: 0 2px;
+}
+
+.sn-mine-ok {
+  color: var(--ops-green);
+  font-size: 11px;
+  margin-left: 4px;
+}
+
+.step-row.focus {
+  outline: 3px solid rgba(230, 81, 0, 0.45);
+  outline-offset: 1px;
+  animation: fn-focus 2.4s ease-out;
+}
+
+@keyframes fn-focus {
+  0% { box-shadow: 0 0 0 0 rgba(230, 81, 0, 0.55); }
+  70% { box-shadow: 0 0 0 12px rgba(230, 81, 0, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(230, 81, 0, 0); }
+}
+
+/* ---------- 右侧通知留痕 ---------- */
+.preview-notices {
+  margin-top: 10px;
+}
+
+.pn-item {
+  font-size: 11px;
+  border-left: 3px solid #c62828;
+  background: #fdecea;
+  border-radius: 4px;
+  padding: 5px 8px;
+  margin-bottom: 6px;
+  line-height: 1.45;
+  color: var(--ops-ink-2);
+}
+
+.pn-item.resolved {
+  border-left-color: var(--ops-green);
+  background: #f1f8e9;
+}
+
+.pn-reason {
+  color: #c62828;
+}
+
+.pn-item.resolved .pn-reason {
+  color: var(--ops-ink-2);
+}
+
+.pn-state {
+  color: var(--ops-grey);
+  font-size: 10.5px;
+}
+
 .tk-fail {
   font-size: 11px;
   color: #c62828;
   font-weight: 700;
   margin-top: 4px;
+}
+
+.tk-unconfirmed {
+  font-size: 10.5px;
+  color: #b71c1c;
+  background: #ffebee;
+  border-radius: 4px;
+  padding: 2px 6px;
+  margin-top: 4px;
+  display: inline-block;
 }
 
 .step-no {

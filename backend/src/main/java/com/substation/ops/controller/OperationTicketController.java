@@ -45,6 +45,12 @@ public class OperationTicketController {
         return ApiResponse.success(operationTicketService.listAll());
     }
 
+    /** 票面出现过的调度员/监护人名单：顶部切换「当前值班员」、按人查通知用 */
+    @GetMapping("/roster")
+    public ApiResponse<List<String>> roster() {
+        return ApiResponse.success(operationTicketService.roster());
+    }
+
     @GetMapping("/{id}")
     public ApiResponse<Map<String, Object>> detail(@PathVariable Long id) {
         return ApiResponse.success(operationTicketService.detail(id));

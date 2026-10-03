@@ -31,4 +31,13 @@ public interface OperationTicketRepository extends JpaRepository<OperationTicket
             + "where o.issueDate between :from and :to "
             + "group by o.issueDate")
     List<TimelineDay> countByDay(@Param("from") LocalDate from, @Param("to") LocalDate to);
+
+    /** 值班员名单：取票面出现过的调度员/监护人（顶部「当前值班员」切换用，JPQL 不支持 union，分两条查询） */
+    @Query("select distinct o.dispatcher from OperationTicket o "
+            + "where o.dispatcher is not null and trim(o.dispatcher) <> ''")
+    List<String> findDistinctDispatcher();
+
+    @Query("select distinct o.guardian from OperationTicket o "
+            + "where o.guardian is not null and trim(o.guardian) <> ''")
+    List<String> findDistinctGuardian();
 }

@@ -102,4 +102,14 @@ export const executeStep = (id, stepNo, person) =>
 export const failStep = (id, stepNo, person, reason) =>
   http.post(`/operation-tickets/${id}/steps/${stepNo}/fail`, { person, reason })
 
+// 票面出现过的调度员/监护人名单（顶部切换当前值班员）
+export const dutyRoster = () => http.get('/operation-tickets/roster')
+
+// 操作失败站内通知（调度员/监护人各自确认，已读互不覆盖；解除后留痕不可删）
+export const myFailureNotices = (person) =>
+  http.get('/failure-notices/mine', { params: { person } })
+
+export const readFailureNotice = (id, person) =>
+  http.post(`/failure-notices/${id}/read`, null, { params: { person } })
+
 export default http

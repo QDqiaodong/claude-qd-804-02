@@ -33,20 +33,26 @@ public class OperationTicketService {
     private final OperationTicketRepository ticketRepository;
     private final OperationStepRepository stepRepository;
     private final BayRepository bayRepository;
+    private final StepFailureNoticeService noticeService;
 
     public OperationTicketService(OperationTicketRepository ticketRepository,
                                   OperationStepRepository stepRepository,
-                                  BayRepository bayRepository) {
+                                  BayRepository bayRepository,
+                                  StepFailureNoticeService noticeService) {
         this.ticketRepository = ticketRepository;
         this.stepRepository = stepRepository;
         this.bayRepository = bayRepository;
+        this.noticeService = noticeService;
     }
 
     @Transactional(readOnly = true)
     public List<Map<String, Object>> listOfDay(LocalDate date) {
         LocalDate day = date == null ? LocalDate.now() : date;
+        List<OperationTicket> tickets = ticketRepository.findByIssueDateOrderByIdAsc(day);
+        Map<Long, Map<String, Object>> noticeSummary =
+                noticeService.activeSummaryByTickets(tickets.stream().map(OperationTicket::getId).toList());
         List<Map<String, Object>> result = new ArrayList<>();
-        for (OperationTicket t : ticketRepository.findByIssueDateOrderByIdAsc(day)) {
+        for (OperationTicket t : tickets) {
             Map<String, Object> map = new HashMap<>();
             map.put("id", t.getId());
             map.put("ticketNo", t.getTicketNo());
@@ -65,6 +71,9 @@ public class OperationTicketService {
             map.put("totalSteps", steps.size());
             map.put("doneSteps", steps.stream().filter(s -> OperationStep.STATUS_DONE.equals(s.getStatus())).count());
             map.put("failedSteps", steps.stream().filter(s -> OperationStep.STATUS_FAILED.equals(s.getStatus())).count());
+            Map<String, Object> nSummary = noticeSummary.get(t.getId());
+            map.put("noticeUnconfirmedRoles",
+                    nSummary == null ? List.of() : nSummary.get("unconfirmedRoles"));
             result.add(map);
         }
         return result;
@@ -100,6 +109,14 @@ public class OperationTicketService {
     }
 
     @Transactional(readOnly = true)
+    public List<String> roster() {
+        java.util.LinkedHashSet<String> names = new java.util.LinkedHashSet<>();
+        names.addAll(ticketRepository.findDistinctDispatcher());
+        names.addAll(ticketRepository.findDistinctGuardian());
+        return new ArrayList<>(names);
+    }
+
+    @Transactional(readOnly = true)
     public Map<String, Object> detail(Long id) {
         OperationTicket ticket = ticketRepository.findById(id)
                 .orElseThrow(() -> new BizException("操作票不存在"));
@@ -120,6 +137,8 @@ public class OperationTicketService {
         map.put("bayName", bay == null ? "" : bay.getName());
 
         List<OperationStep> steps = stepRepository.findByTicketIdOrderByStepNoAsc(ticket.getId());
+        // 未解除失败通知的双方确认矩阵：页面持续标出尚未确认的角色（调度员/监护人）
+        Map<Integer, Map<String, Object>> confirmMatrix = noticeService.activeConfirmMatrix(ticket.getId());
         List<Map<String, Object>> stepList = new ArrayList<>();
         OperationStep nextStep = null;
         for (OperationStep s : steps) {
@@ -138,6 +157,11 @@ public class OperationTicketService {
             item.put("done", done);
             item.put("failed", failed);
             item.put("executable", !done && nextStep == null);
+            // 未解除通知的确认状态随步骤一起下发：通知状态与步骤状态同一查询口径
+            Map<String, Object> confirm = confirmMatrix.get(s.getStepNo());
+            item.put("failureNotice", confirm);
+            item.put("unconfirmedRoles",
+                    confirm == null ? List.of() : confirm.get("unconfirmedRoles"));
             String blockedHint;
             if (done) {
                 blockedHint = "";
@@ -160,6 +184,8 @@ public class OperationTicketService {
         map.put("failedSteps", steps.stream().filter(s -> OperationStep.STATUS_FAILED.equals(s.getStatus())).count());
         map.put("nextStepNo", nextStep == null ? null : nextStep.getStepNo());
         map.put("hasFailure", steps.stream().anyMatch(s -> OperationStep.STATUS_FAILED.equals(s.getStatus())));
+        // 本票全部失败通知（含重试成功后已解除的留痕，双方已读/解除时间保留，不提供删除）
+        map.put("failureNotices", noticeService.listByTicket(ticket.getId()));
         return map;
     }
 
@@ -207,13 +233,17 @@ public class OperationTicketService {
                     + reason + "，当前不要执行第 " + stepNo + " 步");
         }
 
+        LocalDateTime now = LocalDateTime.now();
         target.setStatus(OperationStep.STATUS_DONE);
         target.setExecutePerson(person);
-        target.setExecuteTime(LocalDateTime.now());
+        target.setExecuteTime(now);
         target.setFailPerson(null);
         target.setFailTime(null);
         target.setFailReason(null);
         stepRepository.save(target);
+
+        // 原步重试成功（或首次执行成功）：该步未解除通知转「已解除」，双方已读时间保留
+        noticeService.resolveRetried(ticket.getId(), stepNo, now);
 
         // 直接以数据库当前状态重新统计，避免重试（FAILED→DONE）时重复计数
         List<OperationStep> latest = stepRepository.findByTicketIdOrderByStepNoAsc(ticket.getId());
@@ -260,13 +290,17 @@ public class OperationTicketService {
             throw new BizException("只能对当前待执行的第 " + firstUndone.getStepNo() + " 步登记失败，不能提前登记后续步骤");
         }
 
+        LocalDateTime failTime = LocalDateTime.now();
         target.setStatus(OperationStep.STATUS_FAILED);
         target.setFailPerson(person);
-        target.setFailTime(LocalDateTime.now());
+        target.setFailTime(failTime);
         target.setFailReason(reason);
         stepRepository.save(target);
         ticket.setStatus(OperationTicket.STATUS_RUNNING);
         ticketRepository.save(ticket);
+
+        // 失败记录落库：同一事务内向本票调度员、监护人生成站内通知（内容含票号/步骤/原因/时间）
+        noticeService.publishFailure(ticket, target, person, reason, failTime);
         return detail(id);
     }
 }

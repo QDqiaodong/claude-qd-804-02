@@ -15,6 +15,7 @@ SET NAMES utf8mb4;
 DROP TABLE IF EXISTS `safety_measure_log`;
 DROP TABLE IF EXISTS `safety_measure`;
 DROP TABLE IF EXISTS `work_ticket_event`;
+DROP TABLE IF EXISTS `step_failure_notice`;
 DROP TABLE IF EXISTS `operation_step`;
 DROP TABLE IF EXISTS `operation_ticket`;
 DROP TABLE IF EXISTS `work_ticket`;
@@ -211,6 +212,30 @@ CREATE TABLE `operation_step` (
     UNIQUE KEY `uk_step_ticket_no` (`ticket_id`, `step_no`),
     KEY `idx_step_ticket` (`ticket_id`)
 ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_unicode_ci COMMENT ='倒闸操作步骤';
+
+-- ---------------------------- 9.1 操作失败站内通知（调度员/监护人各一条，已读互不覆盖；解除后留痕不可删） ----------------------------
+CREATE TABLE `step_failure_notice` (
+    `id`             BIGINT       NOT NULL AUTO_INCREMENT,
+    `ticket_id`      BIGINT       NOT NULL COMMENT '所属操作票',
+    `step_no`        INT          NOT NULL COMMENT '失败步骤序号',
+    `recipient_role` VARCHAR(24)  NOT NULL COMMENT '接收人角色：DISPATCHER 调度员/GUARDIAN 监护人',
+    `recipient_name` VARCHAR(32)  NOT NULL COMMENT '接收人姓名（落库时取自票面）',
+    `ticket_no`      VARCHAR(64)  DEFAULT NULL COMMENT '票号（通知内容冗余）',
+    `issue_date`     DATE         DEFAULT NULL COMMENT '票面业务日期（从通知跳入时定位到当天）',
+    `action_desc`    VARCHAR(255) DEFAULT NULL COMMENT '步骤内容（通知内容冗余）',
+    `fail_reason`    VARCHAR(255) NOT NULL COMMENT '失败原因',
+    `fail_person`    VARCHAR(32)  DEFAULT NULL COMMENT '失败登记人',
+    `fail_time`      DATETIME     NOT NULL COMMENT '失败发生时间',
+    `read_time`      DATETIME     DEFAULT NULL COMMENT '本接收人确认已读时间（双方各自独立，互不覆盖）',
+    `status`         VARCHAR(24)  NOT NULL COMMENT 'ACTIVE 未解除/RESOLVED 已解除（原步重试成功）',
+    `resolved_time`  DATETIME     DEFAULT NULL COMMENT '解除时间；已解除记录保留，不得删除',
+    PRIMARY KEY (`id`),
+    -- 同一票同一步的未解除通知每角色至多一条，由失败登记在票行悲观锁内保证；
+    -- 反复失败/重试会留下多条 RESOLVED 留痕，故不加唯一约束
+    KEY `idx_notice_recipient` (`recipient_name`, `status`),
+    KEY `idx_notice_ticket` (`ticket_id`, `status`, `step_no`),
+    KEY `idx_notice_fail_time` (`fail_time`)
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_unicode_ci COMMENT ='操作失败站内通知（解除后留痕）';
 
 -- ---------------------------- 10. 安全措施（逐项确认闭环） ----------------------------
 CREATE TABLE `safety_measure` (
@@ -464,7 +489,7 @@ INSERT INTO `operation_step` (`id`, `ticket_id`, `step_no`, `action_desc`, `exec
     (19, 4, 1, '核对调度令：321 断路器转检修',                         '赵刚', CONCAT(CURDATE(), ' 08:20:00'), 'DONE'),
     (20, 4, 2, '拉开 321 断路器',                                      '赵刚', CONCAT(CURDATE(), ' 08:28:00'), 'DONE'),
     (21, 4, 3, '拉开 3211、3212 隔离开关',                             '赵刚', CONCAT(CURDATE(), ' 08:36:00'), 'DONE'),
-    (22, 4, 4, '验明 321 断路器两侧确无电压',                           NULL, NULL, 'PENDING'),
+    (22, 4, 4, '验明 321 断路器两侧确无电压', NULL, NULL, 'FAILED'),
     (23, 4, 5, '合上 3217 接地刀闸',                                   NULL, NULL, 'PENDING'),
     (24, 4, 6, '在机构箱操作把手上悬挂"禁止合闸"标示牌',                NULL, NULL, 'PENDING'),
     (25, 5, 1, '核对调度令：35kV河西线转冷备',                          NULL, NULL, 'PENDING'),
@@ -487,9 +512,25 @@ INSERT INTO `operation_step` (`id`, `ticket_id`, `step_no`, `action_desc`, `exec
     (38, 7, 3, '取下212断路器及隔离开关操作把手上"禁止合闸，有人工作"标示牌', NULL, NULL, 'PENDING'),
     (39, 7, 4, '拉开 II段母线接地刀闸 217',                            NULL, NULL, 'PENDING');
 
--- =============================================================================
--- 10. 安全措施逐项种子（25 行，覆盖待执行/已执行/待拆除/已拆除/变更留痕各阶段）
--- =============================================================================
+-- 票 4 第 4 步预置一次操作失败登记（停在原步待重试）
+UPDATE `operation_step`
+SET `fail_person` = '赵刚',
+    `fail_time`   = CONCAT(CURDATE(), ' 08:42:00'),
+    `fail_reason` = '321 断路器线路侧验电器无指示，疑似验电器电池亏电，已停用待更换后重试'
+WHERE `id` = 22;
+
+-- 票 4 第 4 步失败的站内通知：调度员（孙振华）已确认，监护人（周涛）尚未确认
+INSERT INTO `step_failure_notice`
+(`id`, `ticket_id`, `step_no`, `recipient_role`, `recipient_name`, `ticket_no`, `issue_date`, `action_desc`,
+ `fail_reason`, `fail_person`, `fail_time`, `read_time`, `status`, `resolved_time`) VALUES
+(1, 4, 4, 'DISPATCHER', '孙振华', 'CZP-HX-01', CURDATE(), '验明 321 断路器两侧确无电压',
+ '321 断路器线路侧验电器无指示，疑似验电器电池亏电，已停用待更换后重试', '赵刚',
+ CONCAT(CURDATE(), ' 08:42:00'), CONCAT(CURDATE(), ' 08:45:00'), 'ACTIVE', NULL),
+(2, 4, 4, 'GUARDIAN', '周涛', 'CZP-HX-01', CURDATE(), '验明 321 断路器两侧确无电压',
+ '321 断路器线路侧验电器无指示，疑似验电器电池亏电，已停用待更换后重试', '赵刚',
+ CONCAT(CURDATE(), ' 08:42:00'), NULL, 'ACTIVE', NULL);
+
+-- ---------------------------- 10. 安全措施逐项种子（25 行，覆盖待执行/已执行/待拆除/已拆除/变更留痕各阶段） ----------------------------
 INSERT INTO `safety_measure`
 (`id`, `ticket_id`, `seq_no`, `version_no`, `measure_type`, `location_bay_id`, `location_desc`, `required_action`, `need_restore`,
  `install_ticket_id`, `install_step_no`, `restore_ticket_id`, `restore_step_no`,

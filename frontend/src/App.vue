@@ -32,6 +32,23 @@
         >
           <el-option v-for="s in stationOptions" :key="s.id" :label="s.name" :value="s.id" />
         </el-select>
+
+        <!-- 当前值班员：演示环境无登录体系，按票面调度员/监护人名单切换；通知按人取数 -->
+        <div class="ops-duty">
+          <span class="ops-duty-label">当前值班员</span>
+          <el-select
+            :model-value="currentUser"
+            size="small"
+            placeholder="选择姓名"
+            style="width: 118px"
+            @change="onDutyChange"
+          >
+            <el-option v-for="n in dutyRosterNames" :key="n" :label="n" :value="n" />
+          </el-select>
+        </div>
+
+        <NotificationBell />
+
         <div class="ops-clock">
           <div class="ops-clock-date">{{ selectedDate }}</div>
           <div class="ops-clock-week">{{ weekdayText }} · {{ shiftText }}</div>
@@ -87,10 +104,12 @@
 </template>
 
 <script setup>
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import { currentPath, currentView, go, routes } from './router'
-import { substations, timeline } from './api'
+import { dutyRoster, substations, timeline } from './api'
+import { currentUser, navigateDate, setCurrentUser } from './session'
+import NotificationBell from './components/NotificationBell.vue'
 
 /** 时间轴可见天数 */
 const WINDOW = 7
@@ -101,6 +120,7 @@ const selectedDate = ref(today)
 const days = ref([])
 const stationOptions = ref([])
 const substationId = ref(null)
+const dutyRosterNames = ref([])
 
 const weekdayText = computed(() => dayWeekCn(selectedDate.value))
 const shiftText = computed(() => (new Date().getHours() < 16 ? '白班 · 08:00—16:00' : '夜班 · 16:00—08:00'))
@@ -166,9 +186,34 @@ async function loadStations() {
   }
 }
 
+async function loadRoster() {
+  try {
+    const res = await dutyRoster()
+    dutyRosterNames.value = res.data || []
+  } catch (e) {
+    dutyRosterNames.value = []
+  }
+}
+
+function onDutyChange(name) {
+  setCurrentUser(name || '')
+}
+
+// 从通知跳入：把时间轴切到票面业务日期（OperationView 同步打开对应票并定位失败步）
+watch(navigateDate, (req) => {
+  if (req && req.date && req.date !== selectedDate.value) {
+    selectedDate.value = req.date
+    if (!days.value.some((d) => d.date === req.date)) {
+      cursorStart.value = addDays(req.date, -3)
+      loadTimeline()
+    }
+  }
+})
+
 onMounted(() => {
   loadTimeline()
   loadStations()
+  loadRoster()
 })
 </script>
 
@@ -258,6 +303,24 @@ onMounted(() => {
   display: flex;
   align-items: center;
   gap: 14px;
+}
+
+.ops-duty {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.ops-duty-label {
+  font-size: 12px;
+  color: rgba(255, 255, 255, 0.85);
+  white-space: nowrap;
+}
+
+/* 头部下拉输入框在橙色 header 内，强制白底 */
+.ops-duty :deep(.el-input__wrapper),
+.ops-header-right > .el-select :deep(.el-input__wrapper) {
+  background: #fff;
 }
 
 .ops-clock {
